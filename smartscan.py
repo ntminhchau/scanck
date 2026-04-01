@@ -7,34 +7,54 @@ from datetime import datetime, timedelta
 from tabulate import tabulate
 from vnstock import Quote
 
+from vnstock import Quote, register_user
+
 # =====================
 # CONFIG & PARAMETERS
 # =====================
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+VNSTOCK_API_KEY = os.getenv("VNSTOCK_API_KEY", "").strip()
 
-try:
-    from vn100_list import VN100
-except ImportError:
-    VN100 = [
-        "HPG", "SSI", "VND", "DIG", "DGC", "VNM", "FPT", "MWG",
-        "TCB", "VPB", "MBB", "STB", "ACB", "KBC", "IDC"
-    ]
+def setup_vnstock_auth():
+    if not VNSTOCK_API_KEY:
+        print("⚠️ Không có VNSTOCK_API_KEY. Sẽ chạy theo chế độ mặc định.")
+        return
 
-PORTFOLIO = VN100
+    try:
+        print("🔐 Đang đăng ký Vnstock Community API key...")
+        # Cố gắng truyền key trực tiếp trước
+        try:
+            register_user(VNSTOCK_API_KEY)
+        except TypeError:
+            # Nếu phiên bản vnstock của bạn không nhận tham số,
+            # fallback sang biến môi trường để thư viện tự đọc
+            os.environ["VNSTOCK_API_KEY"] = VNSTOCK_API_KEY
+            register_user()
+
+        print("✅ Vnstock Community API key đã được kích hoạt.")
+    except Exception as e:
+        print(f"⚠️ Không kích hoạt được Vnstock API key: {e}")
+        print("➡️ Tiếp tục chạy, nhưng có thể quay về giới hạn mặc định.")
+
 LOOKBACK_DAYS = 300
 TR_RANGE = 60
 ATR_WIN = 14
 AVG_VOL_WIN = 20
 RSI_WIN = 14
-SLEEP = 0.6
-SOURCES = ("VCI", "TCBS")
+
+# Số mã muốn quét tự động từ SSI
+TOP_N = int(os.getenv("TOP_N", "100"))
+
+# Delay giữa các mã khi gọi vnstock history
+SLEEP = float(os.getenv("SLEEP", "0.6"))
+
+# Chỉ để 1 source trước cho nhẹ request hơn
+SOURCES = ("VCI",)
 
 # --- Risk & Filter Rules ---
 MIN_RR_EARLY = 2.0
 MIN_RR_SWING = 2.2
-MIN_AVG_VOL = 50_000
-MIN_VAL_BN = 2.0
 MAX_EXTENDED_PCT = 0.12
 RSI_MAX_BUY = 75
 
@@ -56,11 +76,15 @@ SSI_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36 Edg/146.0.0.0",
 }
 
-
 # =====================
 # 1. HELPER FUNCTIONS
 # =====================
 def send_telegram_msg(message: str):
+    print("📨 Chuẩn bị gửi Telegram...")
+    print("   TELEGRAM_TOKEN exists:", bool(TELEGRAM_TOKEN))
+    print("   TELEGRAM_CHAT_ID exists:", bool(TELEGRAM_CHAT_ID))
+    print("   Message length:", len(message) if message else 0)
+
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         print("⚠️ Thiếu TELEGRAM_TOKEN hoặc TELEGRAM_CHAT_ID. Bỏ qua gửi Telegram.")
         return None
@@ -71,9 +95,11 @@ def send_telegram_msg(message: str):
         "text": message,
         "parse_mode": "Markdown"
     }
+
     try:
         response = requests.post(url, data=data, timeout=20)
         print(f"📨 Telegram status: {response.status_code}")
+        print("📨 Telegram response:", response.text[:1000])
         return response.json()
     except Exception as e:
         print(f"❌ Lỗi gửi Telegram: {e}")
@@ -270,6 +296,81 @@ def classify_signal(df, box_h, box_l, trend, event, vol_ratio, tightness, macd_d
 # =====================
 # 3. DATA FETCHING
 # =====================
+def build_portfolio_from_ssi(top_n=100):
+    print("🔄 Building portfolio từ SSI...")
+    exchanges = ["hose", "hnx", "upcom"]
+    all_rows = []
+
+    for ex in exchanges:
+        response = None
+        last_error = None
+        url = f"https://iboard-query.ssi.com.vn/stock/exchange/{ex}?boardId=MAIN"
+
+        for attempt in range(3):
+            try:
+                print(f"🌐 Fetching universe {ex.upper()}... attempt {attempt + 1}/3")
+                response = requests.get(url, headers=SSI_HEADERS, timeout=20)
+                print(f"➡️ HTTP status: {response.status_code}")
+                break
+            except Exception as e:
+                last_error = e
+                print(f"❌ Universe {ex.upper()} attempt {attempt + 1} failed: {e}")
+                time.sleep(2)
+
+        if response is None or response.status_code != 200:
+            print(f"⚠️ Bỏ qua {ex.upper()} | last_error={last_error}")
+            continue
+
+        try:
+            content = response.json()
+        except Exception as e:
+            print(f"❌ Universe {ex.upper()} parse JSON lỗi: {e}")
+            continue
+
+        if isinstance(content, list):
+            items = content
+        elif isinstance(content, dict):
+            if isinstance(content.get("data"), list):
+                items = content["data"]
+            elif isinstance(content.get("items"), list):
+                items = content["items"]
+            else:
+                items = [content]
+        else:
+            items = []
+
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+
+            symbol = str(item.get("stockSymbol", "")).strip().upper()
+            traded_value = pd.to_numeric(item.get("nmTotalTradedValue"), errors="coerce")
+
+            if not symbol or pd.isna(traded_value):
+                continue
+
+            all_rows.append({
+                "symbol": symbol,
+                "exchange": ex.upper(),
+                "value": float(traded_value)
+            })
+
+    if not all_rows:
+        print("🚨 Không build được portfolio từ SSI.")
+        return []
+
+    df = pd.DataFrame(all_rows)
+    df = df.sort_values("value", ascending=False)
+    df = df.drop_duplicates(subset=["symbol"], keep="first")
+
+    top_symbols = df["symbol"].head(top_n).tolist()
+
+    print(f"✅ Selected {len(top_symbols)} mã thanh khoản cao nhất từ SSI")
+    print("📌 Top 20:", top_symbols[:20])
+
+    return top_symbols
+
+
 def fetch_history(symbol: str, start: str, end: str) -> pd.DataFrame | None:
     for src in SOURCES:
         try:
@@ -297,7 +398,6 @@ def fetch_history(symbol: str, start: str, end: str) -> pd.DataFrame | None:
 
 def fetch_ssi_foreign_data():
     print("🔄 Đang lấy dữ liệu khối ngoại trực tuyến từ SSI...")
-
     exchanges = ["hose", "hnx", "upcom"]
     all_data = []
 
@@ -308,13 +408,13 @@ def fetch_ssi_foreign_data():
 
         for attempt in range(3):
             try:
-                print(f"\n🌐 Fetching {ex.upper()}... attempt {attempt + 1}/3")
+                print(f"\n🌐 Fetching foreign {ex.upper()}... attempt {attempt + 1}/3")
                 response = requests.get(url, headers=SSI_HEADERS, timeout=20)
                 print(f"➡️ HTTP status: {response.status_code}")
                 break
             except Exception as e:
                 last_error = e
-                print(f"❌ {ex.upper()} attempt {attempt + 1} failed: {e}")
+                print(f"❌ Foreign {ex.upper()} attempt {attempt + 1} failed: {e}")
                 time.sleep(2)
 
         if response is None:
@@ -381,7 +481,7 @@ def fetch_ssi_foreign_data():
 
 
 # =====================
-# 4. SCANNER RUNNER
+# 4. SCANNER
 # =====================
 def analyze_symbol(symbol, df_nn):
     symbol = str(symbol).strip().upper()
@@ -432,12 +532,12 @@ def analyze_symbol(symbol, df_nn):
     }
 
 
-def build_telegram_message(df_show: pd.DataFrame) -> str:
+def build_telegram_message(df_show: pd.DataFrame, portfolio_size: int) -> str:
     now_str = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
-    msg = f"🚀 *SMART SCAN PRO*\\n_{now_str}_\\n"
+    msg = f"🚀 *SMART SCAN PRO*\n_{now_str}_\nĐã quét: *{portfolio_size}* mã\n"
 
     if df_show.empty:
-        msg += "\nKhông có tín hiệu phù hợp hôm nay."
+        msg += "\nKhông có tín hiệu phù hợp trong lần quét này."
         return msg
 
     for cat, name in [
@@ -466,18 +566,40 @@ def build_telegram_message(df_show: pd.DataFrame) -> str:
 
 
 def run_scanner():
-    print(f"\n🔔 [SYSTEM] Bắt đầu Smart Scan Pro: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC")
+    now_utc = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"\n🔔 [SYSTEM] Bắt đầu Smart Scan Pro: {now_utc} UTC")
+    setup_vnstock_auth()
+    print(f"📌 TOP_N = {TOP_N}")
+    print(f"📌 SLEEP = {SLEEP}")
+    print(f"📌 SOURCES = {SOURCES}")
+
+    portfolio = build_portfolio_from_ssi(top_n=TOP_N)
+    print(f"📌 Tổng số mã trong PORTFOLIO: {len(portfolio)}")
+    print(f"📌 20 mã đầu: {portfolio[:20]}")
+
+    if not portfolio:
+        send_telegram_msg("🚨 *SMART SCAN PRO*\nKhông build được danh sách mã từ SSI.")
+        return
 
     df_nn = fetch_ssi_foreign_data()
+    print(f"📌 Số dòng khối ngoại: {len(df_nn)}")
 
     rows = []
-    for i, s in enumerate(PORTFOLIO):
-        print(f"[{i + 1}/{len(PORTFOLIO)}] Quét mã {s}...", end="\r")
-        rows.append(analyze_symbol(s, df_nn))
+    for i, s in enumerate(portfolio):
+        print(f"[{i + 1}/{len(portfolio)}] Quét mã {s}...", end="\r")
+        row = analyze_symbol(s, df_nn)
+        rows.append(row)
         time.sleep(SLEEP)
 
     print()
     df_all = pd.DataFrame(rows)
+
+    print("\n📊 Signal counts:")
+    if "Signal" in df_all.columns:
+        print(df_all["Signal"].value_counts(dropna=False).to_string())
+
+    print("\n📊 Top 20 results:")
+    print(df_all.head(20).to_string())
 
     df_show = df_all[df_all["Signal"].isin([
         "MOMENTUM_WEEK",
@@ -487,13 +609,18 @@ def run_scanner():
         "WATCH_BOTTOM"
     ])].copy()
 
+    print(f"\n📌 Số mã có tín hiệu gửi Telegram: {len(df_show)}")
+
     if not df_show.empty:
         print("\n" + "=" * 110 + "\n")
         print(tabulate(df_show, headers="keys", tablefmt="grid"))
     else:
         print("ℹ️ Không có tín hiệu phù hợp.")
 
-    msg = build_telegram_message(df_show)
+    msg = build_telegram_message(df_show, len(portfolio))
+    print("\n📨 Message preview:")
+    print(msg[:2000])
+
     send_telegram_msg(msg)
 
 
